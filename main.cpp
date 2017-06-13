@@ -11,37 +11,49 @@
 #include <algorithm>
 #include <cstring>
 
-
 using namespace std;
 
-deque<vector<string>> d;
-map<string, int> m;
 condition_variable cv;
-mutex mux;
-atomic <bool> done = {false};
+condition_variable cv1;
+mutex mtx;
+mutex mtx1;
+mutex mtx2;
+mutex mtx3;
+mutex mtx4;
+mutex mtx5;
+atomic <bool> isReady = {false};
+atomic <bool> isReady1 = {false};
 
+inline std::chrono::high_resolution_clock::time_point get_current_time_fenced() {
+    std::atomic_thread_fence(memory_order_seq_cst);
+    auto res_time = std::chrono::high_resolution_clock::now();
+    std::atomic_thread_fence(memory_order_seq_cst);
+    return res_time;
+}
 
+template<class D>
+inline long long to_us(const D& d) {
+    return std::chrono::duration_cast<chrono::microseconds>(d).count();
+}
 
-
-
-int producer(const string& filename) {
-    fstream fin(filename); //full path to the file
-    if (!fin.is_open()) {
+int producer(const string& filename, deque<vector<string>>& dq) {
+    fstream file(filename);
+    if (!file.is_open()) {
         cout << "error reading from file";
         return  0;
     }
     string line;
     vector<string> lines;
     int counter = 0;
-    int fullBlock = 50;
-    while(getline(fin, line))
+    int linesBlock = 100;
+    while(getline(file, line))
     {
         lines.push_back(line);
-        if (counter == fullBlock)
+        if (counter == linesBlock)
         {
             {
-                lock_guard<mutex> ll(mux);
-                d.push_back(lines);
+                lock_guard<mutex> guard(mtx);
+                dq.push_back(lines);
             }
             cv.notify_one();
             lines.clear();
@@ -50,55 +62,87 @@ int producer(const string& filename) {
         {
             counter++;
         }
-
     }
     if (lines.size() != 0)
     {
         {
-            lock_guard<mutex> ll(mux);
-            d.push_back(lines);
+            lock_guard<mutex> ll(mtx);
+            dq.push_back(lines);
         }
         cv.notify_one();
     }
-    cv.notify_all(); //notify all consumers that words have finished
-    done = true;
+
+    //notify all consumers that words have finished
+    cv.notify_all();
+    isReady = true;
     return 0;
 }
 
-int consumer()
-{
-    while(true)
-    {
-        unique_lock<std::mutex> lk(mux);
-        if (!d.empty()) {
-
-            vector<string> v {d.front()};
-            d.pop_front();
-            lk.unlock();
+int consumer(deque<vector<string>> &dq, deque<map<string, int>> &dq1) {
+    map<string, int> localMap;
+    while(true) {
+        unique_lock<mutex> luk(mtx);
+        if (!dq.empty()) {
+            vector<string> v{dq.front()};
+            dq.pop_front();
+            luk.unlock();
             string word;
-            for(int i = 0; i < v.size(); i++) {
-                //cout<<v[i]<<endl;
-                //cout<<v[i].size()<<endl;
-                istringstream iss(v[i]);
-                while(iss >> word){
 
-                    //cout << word << endl;
-                    char chars[] = ".,:;$%&?*()@!{}[]-^ ";
-                    for (unsigned int a = 0; a < strlen(chars); ++a){
-                        word.erase (std::remove(word.begin(), word.end(), chars[a]), word.end());
-                    }
-                    cout << word << endl;
-                }
-                if(word !="") {
-                    lock_guard<mutex> lg(mux);
-                    ++m[word];
+            for (int i = 0; i < v.size(); i++) {
+                istringstream iss(v[i]);
+                while (iss >> word) {
+                    auto to = begin(word);
+                    for (auto from : word)
+                        if (!ispunct(from))
+                            *to++ = from;
+                    word.resize(distance(begin(word), to));
+                    transform(word.begin(), word.end(), word.begin(), ::tolower);
+                    lock_guard<mutex> lg(mtx2);
+                    ++localMap[word];
                 }
             }
+
+            {
+                lock_guard<mutex> lg(mtx1);
+                dq1.push_back(localMap);
+
+            }
+            cv1.notify_one();
+
+
         } else {
-            if(done)
+            if(isReady) {
                 break;
-            else
-                cv.wait(lk);
+            }
+            cv.wait(luk);
+        }
+    }
+    cv1.notify_all();
+    isReady1 = true;
+    return 0;
+
+}
+
+int finalConsumer(deque<map<string, int>>& dq1, map<string, int>& wordsMap) {
+
+    while(true) {
+        unique_lock<mutex> luk1(mtx1);
+        if (!dq1.empty()) {
+            map<string, int> v1{dq1.front()};
+            dq1.pop_front();
+            luk1.unlock();
+
+            for (map<string,int>::iterator it=v1.begin(); it!=v1.end(); ++it) {
+                lock_guard<mutex> lg(mtx3);
+                wordsMap[it->first] += it->second;
+            }
+
+
+        } else {
+            if (isReady1) {
+                break;
+            }
+            cv1.wait(luk1);
         }
     }
     return 0;
@@ -106,9 +150,104 @@ int consumer()
 }
 
 int main() {
-    string name = "data.txt";
-    thread thr1 = thread(producer, cref(name));
-    thread thr2 = thread(consumer);
-    thr1.join();
-    thr2.join();
+
+    deque<vector<string>> dq;
+    deque<map<string, int>> dq1;
+    map<string, int> wordsMap;
+    string input_data[4], infile, out_by_a, out_by_n;
+    int threads_n;
+    ifstream myFile;
+    myFile.open("data_input.txt");
+
+    for(int i = 0; i < 4; i++)
+        myFile >> input_data[i];
+    myFile.close();
+
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < input_data[i].length(); j++) {
+            if (input_data[i][j] == '=')
+                input_data[i][j] = ' ';
+        }
+        stringstream ss(input_data[i]);
+        string temp;
+        int k = 0;
+        while (ss >> temp) {
+            if (k != 0) {
+                stringstream lineStream(temp);
+                string s;
+                getline(lineStream,s,',');
+                s.erase(remove( s.begin(), s.end(), '\"' ), s.end());
+                input_data[i] = s;
+            }
+            k++;
+        }
+    }
+
+    infile = input_data[0];
+    out_by_a = input_data[1];
+    out_by_n = input_data[2];
+    threads_n = stoi(input_data[3]);
+
+
+    thread threads[threads_n];
+
+    auto startProducer = get_current_time_fenced();
+    threads[0] = thread(producer, cref(infile), ref(dq));
+    auto finishProducer = get_current_time_fenced();
+
+    auto startConsumer = get_current_time_fenced();
+
+
+    int thrIter = 1;
+    while(thrIter != threads_n-1){
+        threads[thrIter] = thread(consumer, ref(dq), ref(dq1));
+        thrIter++;
+        //cout<<thrIter<<endl;
+    }
+
+    //std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    threads[threads_n-1] = thread(finalConsumer, ref(dq1), ref(wordsMap));
+
+    for (auto& th : threads) {
+        th.join();
+    }
+
+
+    auto finishConsumer = get_current_time_fenced();
+
+
+    ofstream file;
+    file.open(out_by_a);
+    if (!file) {
+        cerr << "Could not open file."<< endl;
+        return 1;
+    }
+    for(map<string, int> :: iterator i = wordsMap.begin(); i != wordsMap.end(); i++){
+        file << i->first << ": " << i->second << endl;
+    }
+    file.close();
+
+    vector<pair<string, int>> VectorOfPair;
+    for(map<string, int> :: iterator i = wordsMap.begin(); i != wordsMap.end(); i++){
+        VectorOfPair.push_back(make_pair(i -> first, i-> second));
+    }
+    sort(VectorOfPair.begin(), VectorOfPair.end(), [] (const pair<string,int> &a, const pair<string,int> &b) {
+        return a.second > b.second;
+    });
+
+    //Write in file words by alphabet
+    ofstream file2;
+    file2.open(out_by_n);
+    for (auto p = VectorOfPair.begin(); p != VectorOfPair.end(); p++)
+        file2 << p->first << ": " << p->second << endl;
+    file2.close();
+
+    auto totalTime = get_current_time_fenced();
+    auto totalProducer = finishProducer - startProducer;
+    auto totalConsumer = finishConsumer - startConsumer;
+
+
+    cout << "Reading time: " << to_us(totalProducer) << endl;
+    cout << "Calculating time: " << to_us(totalConsumer) << endl;
+    cout << "Total time: " << to_us(totalTime - startProducer) << endl;
 }
